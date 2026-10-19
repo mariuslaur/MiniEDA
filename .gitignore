@@ -1,0 +1,11 @@
+build/
+verilog/
+.cmake/
+CMakeLists.txt.user
+*.moc
+*.o
+MiniEDA
+parserTest
+build.sh
+build_and_test.sh
+prerequisites.sh
