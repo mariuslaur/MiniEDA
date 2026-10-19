@@ -1,0 +1,31 @@
+name: C++ CMake Qt6 CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install System Dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y build-essential cmake qt6-base-dev qt6-base-private-dev libgl1-mesa-dev libxkbcommon-dev
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Debug .
+
+    - name: Build Project
+      run: cmake --build build --parallel $(nproc)
+
+    - name: Run Unit Tests
+      run: |
+        cd build
+        ctest --output-on-failure
