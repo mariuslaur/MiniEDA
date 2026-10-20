@@ -1,73 +1,97 @@
 #include <QtTest>
-#include <fstream>
-#include <map>
-#include "parser.hpp"
+#include "../include/parser.hpp"
 
-class ParserAndSimulationTest : public QObject {
+class ParserTest : public QObject {
     Q_OBJECT
 
 private slots:
-    void init() {
-        std::ofstream file("test_adder.v");
-        file << "module HalfAdder (input A, input B, output Sum, output Carry);\n"
-             << "    xor gate1 (Sum, A, B);\n"
-             << "    and gate2 (Carry, A, B);\n"
-             << "endmodule\n";
-        file.close();
-    }
-
-    void cleanup() {
-        QFile::remove("test_adder.v");
-    }
-
-    // Test 1: Basic check on the parsed structure.
-    void testSimpleParser() {
-        Circuit c = VerilogParser::parseFile("test_adder.v");
-        QCOMPARE(c.inputs.size(), size_t(2));
-        QCOMPARE(c.outputs.size(), size_t(2));
-        QCOMPARE(c.gates.size(), size_t(2));
-    }
-
-    // Test 2: ANSI syntax support check.
-    void testANSISyntaxParsing() {
-        Circuit c = VerilogParser::parseFile("test_adder.v");
-        QCOMPARE(c.inputs.at(0), std::string("A"));
-        QCOMPARE(c.inputs.at(1), std::string("B"));
-        QCOMPARE(c.gates.at(0).type, std::string("xor"));
-    }
-
-    // Test 3: AND logic check (Tri-State).
-    void testTriStateAndLogic() {
-        int in1_false = 0;
-        int in2_z = -1;
-        int out_with_zero = (in1_false == 0 || in2_z == 0) ? 0 : -1;
-        QCOMPARE(out_with_zero, 0); // 0 AND Z = 0
-
-        int in1_true = 1;
-        int out_with_one = (in1_true == 0 || in2_z == 0) ? 0 : -1;
-        QCOMPARE(out_with_one, -1); // 1 AND Z = Z (-1)
-    }
-
-    // Test 4: XOR logic check (Tri-State).
-    void testTriStateXorLogic() {
-        int in1 = 1;
-        int in2 = 0;
-        int out_normal = in1 ^ in2;
-        QCOMPARE(out_normal, 1); // 1 XOR 0 = 1
-
-        int in_z = -1;
-        int out_z = (in1 == -1 || in_z == -1) ? -1 : (in1 ^ in_z);
-        QCOMPARE(out_z, -1); // 1 XOR Z = Z (-1)
-    }
-
-    // Test 5: File not found check.
-    void testInvalidFileHandling() {
-        Circuit c = VerilogParser::parseFile("non_existent_file.v");
-        QVERIFY(c.gates.empty());
-        QVERIFY(c.inputs.empty());
-    }
+    void testNewGatesParsing();
+    void testTriStateLogicPropagation();
+    void testSyntaxErrorPositionTracking();
 };
 
-// Qt macro generating main() function for this test execution.
-QTEST_MAIN(ParserAndSimulationTest)
+void ParserTest::testNewGatesParsing() {
+    MiniEDA::Parser parser;
+    std::string verilog = 
+        "module TestCircuit (input a, b, output out1, out2, out3, out4, out5);\n"
+        "  nand g1 (out1, a, b);\n"
+        "  nor  g2 (out2, a, b);\n"
+        "  xnor g3 (out3, a, b);\n"
+        "  buf  g4 (out4, a);\n"
+        "  not  g5 (out5, b);\n"
+        "endmodule";
+
+    QVERIFY(parser.parseNetlist(verilog));
+    QCOMPARE(parser.getGates().size(), 5U);
+    QCOMPARE(parser.getGates().at(0).type, MiniEDA::GateType::NAND);
+    QCOMPARE(parser.getGates().at(1).type, MiniEDA::GateType::NOR);
+    QCOMPARE(parser.getGates().at(2).type, MiniEDA::GateType::XNOR);
+    QCOMPARE(parser.getGates().at(3).type, MiniEDA::GateType::BUF);
+    QCOMPARE(parser.getGates().at(4).type, MiniEDA::GateType::NOT);
+}
+
+void ParserTest::testTriStateLogicPropagation() {
+    MiniEDA::Parser parser;
+    std::string verilog = 
+        "module FullSet (input A, B, output Y_nand, Y_nor, Y_xnor, Y_buf, Y_not);\n"
+        "  nand g1 (Y_nand, A, B);\n"
+        "  nor  g2 (Y_nor, A, B);\n"
+        "  xnor g3 (Y_xnor, A, B);\n"
+        "  buf  g4 (Y_buf, A);\n"
+        "  not  g5 (Y_not, B);\n"
+        "endmodule";
+
+    QVERIFY(parser.parseNetlist(verilog));
+
+    // 1: Default (Z)
+    parser.evaluateCircuit();
+    QCOMPARE(parser.getWireState("Y_nand"), MiniEDA::LogicState::HighImpedance);
+    QCOMPARE(parser.getWireState("Y_nor"), MiniEDA::LogicState::HighImpedance);
+
+    // 2: A = 1, B = 0
+    parser.setInputState("A", MiniEDA::LogicState::LogicHigh);
+    parser.setInputState("B", MiniEDA::LogicState::LogicLow);
+    parser.evaluateCircuit();
+
+    QCOMPARE(parser.getWireState("Y_nand"), MiniEDA::LogicState::LogicHigh); // 1 NAND 0 = 1
+    QCOMPARE(parser.getWireState("Y_nor"), MiniEDA::LogicState::LogicLow);   // 1 NOR 0 = 0
+    QCOMPARE(parser.getWireState("Y_xnor"), MiniEDA::LogicState::LogicLow);  // 1 XNOR 0 = 0
+    QCOMPARE(parser.getWireState("Y_buf"), MiniEDA::LogicState::LogicHigh);  // BUF 1 = 1
+    QCOMPARE(parser.getWireState("Y_not"), MiniEDA::LogicState::LogicHigh);  // NOT 0 = 1
+}
+
+void ParserTest::testSyntaxErrorPositionTracking() {
+    MiniEDA::Parser parser;
+    
+    // Scenario A: Missing terminal semicolon on wire declaration (Line 3)
+    std::string badVerilogSemicolon = 
+        "module ErrorModule (input a, output b);\n"
+        "  wire internal_net1, internal_net2\n" // Semicolon missing here
+        "  and g1 (b, a, internal_net1);\n"
+        "endmodule";
+
+    QVERIFY_EXCEPTION_THROWN(parser.parseNetlist(badVerilogSemicolon), MiniEDA::SyntaxException);
+    
+    try {
+        parser.parseNetlist(badVerilogSemicolon);
+    } catch (const MiniEDA::SyntaxException& ex) {
+        QCOMPARE(ex.line(), 2U);
+        QCOMPARE(ex.column(), 3U); // Starts exactly at the keyword block
+    }
+
+    // Scenario B: Anonymous gate initialization structural error
+    std::string badAnonymousGate = 
+        "module ErrorModule2 (input a, output b);\n"
+        "  not (b, a);\n" // Gate instance identifier missing name
+        "endmodule";
+
+    try {
+        parser.parseNetlist(badAnonymousGate);
+    } catch (const MiniEDA::SyntaxException& ex) {
+        QCOMPARE(ex.line(), 2U);
+        QCOMPARE(ex.rawMessage(), std::string("Anonymous gate instantiation block discovered. Gate name required"));
+    }
+}
+
+QTEST_MAIN(ParserTest)
 #include "parserTest.moc"

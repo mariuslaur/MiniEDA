@@ -67,6 +67,7 @@ class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     MainWindow(QWidget *parent = nullptr);
+    ~MainWindow();
 private slots:
     void openFile();
     void runSimulation();
@@ -74,7 +75,7 @@ private:
     QTextEdit *editor;
     QGraphicsView *view;
     QGraphicsScene *scene;
-    Circuit currentCircuit;
+    MiniEDA::Parser m_parser; 
 
     std::map<std::string, int> inputStates; 
     
