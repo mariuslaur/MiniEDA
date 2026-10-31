@@ -10,28 +10,60 @@ enable_testing()
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets Test)
 
-# 1. Aplicația Principală Grafică
-file(GLOB_RECURSE SOURCES "src/*.cpp" "include/*.hpp")
-add_executable(MiniEDA ${SOURCES})
-target_include_directories(MiniEDA PRIVATE include)
-target_link_libraries(MiniEDA PRIVATE Qt6::Widgets)
-
-# 2. Executabilul de Unit Test (Aparține exclusiv procesului de testare)
-add_executable(parserTest 
-    tests/parserTest.cpp
-    src/parser.cpp       # Includem unitatea pe care o testăm direct
+# 1. Nucleul fără interfață grafică: lexer, parser și simulator (C++ standard, fără Qt)
+add_library(MiniEDACore STATIC
+    src/lexer.cpp
+    src/parser.cpp
+    src/simulator.cpp
+    include/netlist.hpp
+    include/lexer.hpp
     include/parser.hpp
+    include/simulator.hpp
 )
-target_include_directories(parserTest PRIVATE include)
-target_link_libraries(parserTest PRIVATE Qt6::Test Qt6::Widgets)
+target_include_directories(MiniEDACore PUBLIC include)
+set_target_properties(MiniEDACore PROPERTIES AUTOMOC OFF)
 
-# Înregistrăm fiecare funcție de test QtTest ca test separat în CTest.
-# Numele sunt extrase automat din declarațiile "void testX();" din parserTest.cpp,
-# iar CMake se reconfigurează singur când fișierul de test se modifică.
-set(PARSER_TEST_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/parserTest.cpp)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PARSER_TEST_SOURCE})
-file(STRINGS ${PARSER_TEST_SOURCE} PARSER_TEST_DECLS REGEX "^[ \t]*void[ \t]+test[A-Za-z0-9_]*[ \t]*\\([ \t]*\\)[ \t]*;")
-foreach(decl ${PARSER_TEST_DECLS})
-    string(REGEX REPLACE "^[ \t]*void[ \t]+(test[A-Za-z0-9_]*).*" "\\1" testName "${decl}")
-    add_test(NAME Parser.${testName} COMMAND parserTest ${testName})
-endforeach()
+# 2. Așezarea schemei și rutarea firelor: geometrie pură (doar Qt Core), testabilă fără interfață
+add_library(MiniEDALayout STATIC
+    src/schematicLayout.cpp
+    include/schematicLayout.hpp
+)
+target_link_libraries(MiniEDALayout PUBLIC MiniEDACore Qt6::Core)
+set_target_properties(MiniEDALayout PROPERTIES AUTOMOC OFF)
+
+# 3. Aplicația Principală Grafică
+add_executable(MiniEDA
+    src/main.cpp
+    src/mainWindow.cpp
+    src/schematicScene.cpp
+    src/circuitItems.cpp
+    src/zoomableView.cpp
+    include/mainWindow.hpp
+    include/schematicScene.hpp
+    include/circuitItems.hpp
+    include/zoomableView.hpp
+)
+target_link_libraries(MiniEDA PRIVATE MiniEDALayout Qt6::Widgets)
+
+# 4. Executabilele de Unit Test, câte unul pentru fiecare fișier din tests/.
+# Fiecare funcție de test QtTest devine un test separat în CTest (<Prefix>.<testName>);
+# numele sunt extrase automat din declarațiile "void testX();", iar CMake se
+# reconfigurează singur când fișierul de test se modifică.
+function(add_qt_test_suite target prefix)
+    set(source ${CMAKE_CURRENT_SOURCE_DIR}/tests/${target}.cpp)
+    add_executable(${target} ${source} tests/testUtils.hpp)
+    target_link_libraries(${target} PRIVATE ${ARGN} Qt6::Test)
+    # Testele pot încărca direct exemplele din verilog/
+    target_compile_definitions(${target} PRIVATE MINIEDA_VERILOG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/verilog")
+
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${source})
+    file(STRINGS ${source} decls REGEX "^[ \t]*void[ \t]+test[A-Za-z0-9_]*[ \t]*\\([ \t]*\\)[ \t]*;")
+    foreach(decl ${decls})
+        string(REGEX REPLACE "^[ \t]*void[ \t]+(test[A-Za-z0-9_]*).*" "\\1" testName "${decl}")
+        add_test(NAME ${prefix}.${testName} COMMAND ${target} ${testName})
+    endforeach()
+endfunction()
+
+add_qt_test_suite(parserTest Parser MiniEDACore)
+add_qt_test_suite(simulatorTest Simulator MiniEDACore)
+add_qt_test_suite(layoutTest Layout MiniEDALayout)

@@ -1,181 +1,236 @@
 #include "parser.hpp"
-#include <sstream>
-#include <algorithm>
 #include <cctype>
 
 namespace MiniEDA {
 
-void Parser::tokenize(const std::string& code, std::vector<Token>& tokens) const {
-    std::string current;
-    size_t currentLine = 1;
-    size_t currentColumn = 1;
-    size_t tokenStartColumn = 1;
-
-    for (size_t i = 0; i < code.length(); ++i) {
-        char ch = code[i];
-
-        // REPAIR: Explicitly skip Carriage Return '\r' characters to prevent Windows/Linux line-ending corruption
-        if (ch == '\r') {
-            currentColumn++;
-            continue;
-        }
-
-        // Skip '//' line comments and '/* */' block comments, keeping line/column tracking intact
-        if (ch == '/' && i + 1 < code.length() && (code[i + 1] == '/' || code[i + 1] == '*')) {
-            if (!current.empty()) {
-                tokens.push_back({current, currentLine, tokenStartColumn});
-                current.clear();
-            }
-            bool blockComment = (code[i + 1] == '*');
-            i += 2;
-            currentColumn += 2;
-            while (i < code.length()) {
-                if (!blockComment && code[i] == '\n') {
-                    i--; // Let the main loop consume the newline and advance the line counter
-                    break;
-                }
-                if (blockComment && code[i] == '*' && i + 1 < code.length() && code[i + 1] == '/') {
-                    i++;
-                    currentColumn += 2;
-                    break;
-                }
-                if (code[i] == '\n') {
-                    currentLine++;
-                    currentColumn = 1;
-                } else {
-                    currentColumn++;
-                }
-                i++;
-            }
-            continue;
-        }
-
-        if (std::isspace(ch)) {
-            if (!current.empty()) {
-                tokens.push_back({current, currentLine, tokenStartColumn});
-                current.clear();
-            }
-            if (ch == '\n') {
-                currentLine++;
-                currentColumn = 1;
-            } else {
-                currentColumn++;
-            }
-        } else if (ch == ';' || ch == ',' || ch == '(' || ch == ')' || ch == '[' || ch == ']' || ch == ':' ||
-                   ch == '=' || ch == '&' || ch == '|' || ch == '^' || ch == '~' || ch == '!') {
-            if (!current.empty()) {
-                tokens.push_back({current, currentLine, tokenStartColumn});
-                current.clear();
-            }
-            // Add the special single character delimiter with its direct position
-            tokens.push_back({std::string(1, ch), currentLine, currentColumn});
-            currentColumn++;
-        } else {
-            if (current.empty()) {
-                tokenStartColumn = currentColumn;
-            }
-            current += ch;
-            currentColumn++;
-        }
-    }
-    if (!current.empty()) {
-        tokens.push_back({current, currentLine, tokenStartColumn});
-    }
-}
-
-void Parser::addPort(std::vector<std::string>& list, const std::string& name) {
-    if (std::find(list.begin(), list.end(), name) == list.end()) {
-        list.push_back(name);
-    }
-    m_wireStates[name] = LogicState::HighImpedance;
-}
-
 namespace {
 
-// Token at position i, or the last token when i ran past the end (for error coordinates)
-const Token& tokenAt(const std::vector<Token>& tokens, size_t i) {
-    return tokens[std::min(i, tokens.size() - 1)];
+// Words that can never be net names; one of them inside a declaration means a missing ';'
+bool isKeyword(const std::string& value) {
+    return value == "module" || value == "endmodule" || value == "input" || value == "output" ||
+           value == "wire" || value == "reg" || value == "assign" || gateTypeFromName(value).has_value();
 }
 
-bool isDelimiter(const std::string& val) {
-    return val.size() == 1 && std::string(";,()[]:=&|^~!").find(val[0]) != std::string::npos;
-}
-
-bool isReserved(const std::string& val) {
-    return val == "module" || val == "endmodule" || val == "input" || val == "output" || val == "wire" ||
-           val == "reg" || val == "assign" || val == "and" || val == "or" || val == "xor" || val == "nand" ||
-           val == "nor" || val == "xnor" || val == "buf" || val == "not";
-}
-
-bool isNumber(const std::string& val) {
-    return !val.empty() && std::all_of(val.begin(), val.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); });
-}
-
-// True when tokens i and i+1 are `first` and `second` written without a gap (e.g. "~^", "&&")
-bool isAdjacentPair(const std::vector<Token>& tokens, size_t i, const char* first, const char* second) {
-    return i + 1 < tokens.size() && tokens[i].value == first && tokens[i + 1].value == second &&
-           tokens[i].line == tokens[i + 1].line && tokens[i + 1].column == tokens[i].column + 1;
+bool isNumber(const std::string& value) {
+    return !value.empty() && std::all_of(value.begin(), value.end(),
+                                         [](char c) { return std::isdigit(static_cast<unsigned char>(c)); });
 }
 
 } // namespace
 
+Netlist Parser::parse(const std::string& verilogCode) {
+    m_tokens = tokenize(verilogCode);
+    m_pos = 0;
+    m_netlist = Netlist{};
+    m_vectorRanges.clear();
+    m_assignCounter = 0;
+
+    while (!atEnd()) {
+        const std::string& word = m_tokens[m_pos].value;
+        if (word == "module") {
+            parseModuleHeader();
+        } else if (word == "input" || word == "output" || word == "wire") {
+            parseDeclaration();
+        } else if (gateTypeFromName(word)) {
+            parseGateInstance();
+        } else if (word == "assign") {
+            parseAssign();
+        }
+        m_pos++; // Past the terminating ';' (or an ignored token such as "endmodule")
+    }
+    return std::move(m_netlist);
+}
+
+// ---- Statements ----
+
+void Parser::parseModuleHeader() {
+    const Token& moduleTok = m_tokens[m_pos];
+    m_pos++; // Advance past 'module'
+    if (atEnd() || isDelimiter(m_tokens[m_pos].value) || isKeyword(m_tokens[m_pos].value)) {
+        fail("Module name required after 'module'", moduleTok);
+    }
+    m_netlist.moduleName = m_tokens[m_pos].value;
+    m_pos++;
+
+    // ANSI-style headers: the direction keyword (and optional range) applies to every following
+    // identifier until the next direction keyword (e.g. "input a, b, output [1:0] y")
+    std::string direction;
+    bool isVector = false;
+    int msb = 0, lsb = 0;
+    while (!atEnd() && m_tokens[m_pos].value != ";") {
+        const std::string& val = m_tokens[m_pos].value;
+        if (val == "input" || val == "output") {
+            direction = val;
+            isVector = false;
+        } else if (val == "[") {
+            isVector = parseRange(msb, lsb);
+            continue;
+        } else if (val != "," && val != "(" && val != ")" && val != "wire" && val != "reg") {
+            if (direction == "input") declareNets(m_netlist.inputs, val, isVector, msb, lsb);
+            else if (direction == "output") declareNets(m_netlist.outputs, val, isVector, msb, lsb);
+        }
+        m_pos++;
+    }
+}
+
+void Parser::parseDeclaration() {
+    const Token& keyword = m_tokens[m_pos];
+    std::vector<std::string>& target = keyword.value == "input"  ? m_netlist.inputs
+                                     : keyword.value == "output" ? m_netlist.outputs
+                                                                 : m_netlist.wires;
+    m_pos++; // Advance past 'input'/'output'/'wire'
+
+    bool isVector = false;
+    int msb = 0, lsb = 0;
+    while (!atEnd()) {
+        const std::string& val = m_tokens[m_pos].value;
+        if (val == ";") return;
+        // A keyword here means the declaration was not closed with a semicolon
+        if (isKeyword(val)) break;
+        if (val == "[") {
+            isVector = parseRange(msb, lsb);
+            continue;
+        }
+        if (val != ",") declareNets(target, val, isVector, msb, lsb);
+        m_pos++;
+    }
+    fail("Unterminated keyword block sequence, expected terminal ';'", keyword);
+}
+
+void Parser::parseGateInstance() {
+    const Token& keyword = m_tokens[m_pos];
+    Gate gate;
+    gate.type = *gateTypeFromName(keyword.value);
+    m_pos++;
+
+    if (atEnd() || m_tokens[m_pos].value == "(") {
+        fail("Anonymous gate instantiation block discovered. Gate name required", keyword);
+    }
+    gate.name = m_tokens[m_pos].value;
+    m_pos++;
+
+    if (!peekIs("(")) {
+        fail("Expected pin list opening boundary wrapper '('", current());
+    }
+    m_pos++;
+
+    std::vector<std::string> pins;
+    while (!atEnd() && m_tokens[m_pos].value != ")") {
+        if (m_tokens[m_pos].value == ",") {
+            m_pos++;
+            continue;
+        }
+        pins.push_back(parseNetRef()); // Accepts scalar nets and bit selects "a[0]"
+    }
+    if (atEnd()) {
+        fail("Unbalanced syntax encapsulation, missing wire closing boundary wrapper ')'", current());
+    }
+    m_pos++; // Advance beyond ')'
+
+    if (!peekIs(";")) {
+        fail("Missing required instruction termination sequence operator ';'", m_tokens[m_pos - 1]);
+    }
+    if (pins.empty()) {
+        fail("Empty component structural net connections mapping inside pin list instantiation", m_tokens[m_pos]);
+    }
+
+    // First pin is the output, the rest are inputs
+    gate.outputWire = pins.front();
+    gate.inputWires.assign(pins.begin() + 1, pins.end());
+    m_netlist.gates.push_back(std::move(gate));
+}
+
+void Parser::parseAssign() {
+    // Continuous assignment: "assign lhs = <boolean expression>;" is lowered into gates
+    size_t line = m_tokens[m_pos].line;
+    m_pos++;
+    std::string lhs = parseNetRef();
+
+    if (!peekIs("=")) fail("Expected '=' in continuous assignment", current());
+    m_pos++;
+
+    auto& gates = m_netlist.gates;
+    size_t gatesBefore = gates.size();
+    std::string rhs = parseOrExpr(line);
+
+    if (!peekIs(";")) fail("Missing required instruction termination sequence operator ';'", current());
+
+    if (gates.size() > gatesBefore && gates.back().outputWire == rhs) {
+        // The expression's root gate drives the target directly, no extra buffer needed
+        gates.back().outputWire = lhs;
+    } else {
+        // Plain net-to-net assignment ("assign y = w;") becomes a buffer
+        ++m_assignCounter;
+        gates.push_back({"assign_L" + std::to_string(line) + "_" + std::to_string(m_assignCounter),
+                         GateType::BUF, lhs, {rhs}});
+    }
+}
+
+// ---- Nets and vectors ----
+
 void Parser::declareNets(std::vector<std::string>& list, const std::string& name, bool isVector, int msb, int lsb) {
+    auto addUnique = [&list](const std::string& net) {
+        if (std::find(list.begin(), list.end(), net) == list.end()) list.push_back(net);
+    };
     if (!isVector) {
-        addPort(list, name);
+        addUnique(name);
         return;
     }
     m_vectorRanges[name] = {msb, lsb};
     int step = (msb >= lsb) ? -1 : 1;
     for (int bit = msb; ; bit += step) {
-        addPort(list, name + "[" + std::to_string(bit) + "]");
+        addUnique(name + "[" + std::to_string(bit) + "]");
         if (bit == lsb) break;
     }
 }
 
-bool Parser::parseRange(const std::vector<Token>& tokens, size_t& i, int& msb, int& lsb) const {
-    if (i >= tokens.size() || tokens[i].value != "[") return false;
-    const Token& open = tokens[i];
-    if (i + 4 >= tokens.size() || !isNumber(tokens[i + 1].value) || tokens[i + 2].value != ":" ||
-        !isNumber(tokens[i + 3].value) || tokens[i + 4].value != "]") {
-        throw SyntaxException("Malformed vector range, expected '[msb:lsb]'", open.line, open.column);
+bool Parser::parseRange(int& msb, int& lsb) {
+    if (!peekIs("[")) return false;
+    const Token& open = m_tokens[m_pos];
+    size_t i = m_pos;
+    if (i + 4 >= m_tokens.size() || !isNumber(m_tokens[i + 1].value) || m_tokens[i + 2].value != ":" ||
+        !isNumber(m_tokens[i + 3].value) || m_tokens[i + 4].value != "]") {
+        fail("Malformed vector range, expected '[msb:lsb]'", open);
     }
-    msb = std::stoi(tokens[i + 1].value);
-    lsb = std::stoi(tokens[i + 3].value);
-    i += 5;
+    msb = std::stoi(m_tokens[i + 1].value);
+    lsb = std::stoi(m_tokens[i + 3].value);
+    m_pos += 5;
     return true;
 }
 
-std::string Parser::parseNetRef(const std::vector<Token>& tokens, size_t& i) const {
-    if (i >= tokens.size() || isDelimiter(tokens[i].value) || isReserved(tokens[i].value)) {
-        const Token& errTok = tokenAt(tokens, i);
-        throw SyntaxException("Expected net identifier", errTok.line, errTok.column);
+std::string Parser::parseNetRef() {
+    if (atEnd() || isDelimiter(m_tokens[m_pos].value) || isKeyword(m_tokens[m_pos].value)) {
+        fail("Expected net identifier", current());
     }
-    const Token& nameTok = tokens[i];
-    std::string name = nameTok.value;
-    i++;
+    const Token& nameTok = m_tokens[m_pos];
+    const std::string& name = nameTok.value;
+    m_pos++;
 
     auto range = m_vectorRanges.find(name);
-    if (i < tokens.size() && tokens[i].value == "[") {
-        if (i + 2 >= tokens.size() || !isNumber(tokens[i + 1].value) || tokens[i + 2].value != "]") {
-            throw SyntaxException("Malformed bit select, expected '[index]'", tokens[i].line, tokens[i].column);
+    if (peekIs("[")) {
+        size_t i = m_pos;
+        if (i + 2 >= m_tokens.size() || !isNumber(m_tokens[i + 1].value) || m_tokens[i + 2].value != "]") {
+            fail("Malformed bit select, expected '[index]'", m_tokens[i]);
         }
-        int bit = std::stoi(tokens[i + 1].value);
+        int bit = std::stoi(m_tokens[i + 1].value);
         if (range != m_vectorRanges.end()) {
             int lo = std::min(range->second.first, range->second.second);
             int hi = std::max(range->second.first, range->second.second);
             if (bit < lo || bit > hi) {
-                throw SyntaxException("Bit select '" + name + "[" + std::to_string(bit) + "]' is outside the declared range",
-                                      tokens[i + 1].line, tokens[i + 1].column);
+                fail("Bit select '" + name + "[" + std::to_string(bit) + "]' is outside the declared range",
+                     m_tokens[i + 1]);
             }
         }
-        i += 3;
+        m_pos += 3;
         return name + "[" + std::to_string(bit) + "]";
     }
     if (range != m_vectorRanges.end()) {
-        throw SyntaxException("Vector net '" + name + "' requires a bit select", nameTok.line, nameTok.column);
+        fail("Vector net '" + name + "' requires a bit select", nameTok);
     }
     return name;
 }
+
+// ---- assign expressions ----
 
 std::string Parser::emitAssignGate(GateType type, const std::vector<std::string>& inputs, size_t line) {
     ++m_assignCounter;
@@ -184,34 +239,33 @@ std::string Parser::emitAssignGate(GateType type, const std::vector<std::string>
     gate.type = type;
     gate.outputWire = "$n" + std::to_string(m_assignCounter);
     gate.inputWires = inputs;
-    m_wireStates[gate.outputWire] = LogicState::HighImpedance;
-    m_gates.push_back(gate);
+    m_netlist.gates.push_back(gate);
     return gate.outputWire;
 }
 
 // Verilog precedence (1-bit): unary ~ ! > & && > ^ ~^ > | ||
-std::string Parser::parseOrExpr(const std::vector<Token>& tokens, size_t& i, size_t line) {
-    std::vector<std::string> operands{parseXorExpr(tokens, i, line)};
-    while (i < tokens.size() && tokens[i].value == "|") {
-        i += isAdjacentPair(tokens, i, "|", "|") ? 2 : 1; // '||' behaves like '|' on 1-bit nets
-        operands.push_back(parseXorExpr(tokens, i, line));
+std::string Parser::parseOrExpr(size_t line) {
+    std::vector<std::string> operands{parseXorExpr(line)};
+    while (peekIs("|")) {
+        m_pos += peekAdjacentPair("|", "|") ? 2 : 1; // '||' behaves like '|' on 1-bit nets
+        operands.push_back(parseXorExpr(line));
     }
     return operands.size() == 1 ? operands[0] : emitAssignGate(GateType::OR, operands, line);
 }
 
-std::string Parser::parseXorExpr(const std::vector<Token>& tokens, size_t& i, size_t line) {
-    std::vector<std::string> operands{parseAndExpr(tokens, i, line)};
-    while (i < tokens.size()) {
+std::string Parser::parseXorExpr(size_t line) {
+    std::vector<std::string> operands{parseAndExpr(line)};
+    while (!atEnd()) {
         bool xnorOp = false;
-        if (isAdjacentPair(tokens, i, "~", "^") || isAdjacentPair(tokens, i, "^", "~")) {
+        if (peekAdjacentPair("~", "^") || peekAdjacentPair("^", "~")) {
             xnorOp = true;
-            i += 2;
-        } else if (tokens[i].value == "^") {
-            i++;
+            m_pos += 2;
+        } else if (peekIs("^")) {
+            m_pos++;
         } else {
             break;
         }
-        std::string rhs = parseAndExpr(tokens, i, line);
+        std::string rhs = parseAndExpr(line);
         if (xnorOp) {
             // An n-input XNOR is not a chain of 2-input XNORs, so each '~^' gets its own gate
             std::string lhs = operands.size() == 1 ? operands[0] : emitAssignGate(GateType::XOR, operands, line);
@@ -223,271 +277,44 @@ std::string Parser::parseXorExpr(const std::vector<Token>& tokens, size_t& i, si
     return operands.size() == 1 ? operands[0] : emitAssignGate(GateType::XOR, operands, line);
 }
 
-std::string Parser::parseAndExpr(const std::vector<Token>& tokens, size_t& i, size_t line) {
-    std::vector<std::string> operands{parseUnaryExpr(tokens, i, line)};
-    while (i < tokens.size() && tokens[i].value == "&") {
-        i += isAdjacentPair(tokens, i, "&", "&") ? 2 : 1; // '&&' behaves like '&' on 1-bit nets
-        operands.push_back(parseUnaryExpr(tokens, i, line));
+std::string Parser::parseAndExpr(size_t line) {
+    std::vector<std::string> operands{parseUnaryExpr(line)};
+    while (peekIs("&")) {
+        m_pos += peekAdjacentPair("&", "&") ? 2 : 1; // '&&' behaves like '&' on 1-bit nets
+        operands.push_back(parseUnaryExpr(line));
     }
     return operands.size() == 1 ? operands[0] : emitAssignGate(GateType::AND, operands, line);
 }
 
-std::string Parser::parseUnaryExpr(const std::vector<Token>& tokens, size_t& i, size_t line) {
-    if (i < tokens.size() && (tokens[i].value == "~" || tokens[i].value == "!")) {
-        i++;
-        return emitAssignGate(GateType::NOT, {parseUnaryExpr(tokens, i, line)}, line);
+std::string Parser::parseUnaryExpr(size_t line) {
+    if (peekIs("~") || peekIs("!")) {
+        m_pos++;
+        return emitAssignGate(GateType::NOT, {parseUnaryExpr(line)}, line);
     }
-    if (i < tokens.size() && tokens[i].value == "(") {
-        const Token& open = tokens[i];
-        i++;
-        std::string inner = parseOrExpr(tokens, i, line);
-        if (i >= tokens.size() || tokens[i].value != ")") {
-            throw SyntaxException("Unbalanced parenthesis in expression, missing ')'", open.line, open.column);
+    if (peekIs("(")) {
+        const Token& open = m_tokens[m_pos];
+        m_pos++;
+        std::string inner = parseOrExpr(line);
+        if (!peekIs(")")) {
+            fail("Unbalanced parenthesis in expression, missing ')'", open);
         }
-        i++;
+        m_pos++;
         return inner;
     }
-    return parseNetRef(tokens, i);
+    return parseNetRef();
 }
 
-GateType Parser::stringToGateType(const std::string& gateStr, size_t line, size_t col) const {
-    if (gateStr == "and")  return GateType::AND;
-    if (gateStr == "or")   return GateType::OR;
-    if (gateStr == "xor")  return GateType::XOR;
-    if (gateStr == "nand") return GateType::NAND;
-    if (gateStr == "nor")  return GateType::NOR;
-    if (gateStr == "xnor") return GateType::XNOR;
-    if (gateStr == "buf")  return GateType::BUF;
-    if (gateStr == "not")  return GateType::NOT;
-    throw SyntaxException("Unknown gate primitive target: '" + gateStr + "'", line, col);
+// ---- Token helpers ----
+
+bool Parser::peekAdjacentPair(const char* first, const char* second) const {
+    if (m_pos + 1 >= m_tokens.size()) return false;
+    const Token& a = m_tokens[m_pos];
+    const Token& b = m_tokens[m_pos + 1];
+    return a.value == first && b.value == second && a.line == b.line && b.column == a.column + 1;
 }
 
-bool Parser::parseNetlist(const std::string& verilogCode) {
-    m_inputs.clear(); m_outputs.clear(); m_wires.clear(); m_gates.clear(); m_wireStates.clear();
-    m_vectorRanges.clear(); m_assignCounter = 0;
-    std::vector<Token> tokens;
-    tokenize(verilogCode, tokens);
-
-    size_t i = 0;
-    while (i < tokens.size()) {
-        if (tokens[i].value == "module") {
-            i++; // Advance past 'module'
-            if (i < tokens.size()) {
-                // Skips module name identifier safely
-                i++; 
-            }
-            
-            // Parse tokens inside the module header declaration safely before terminal ';'
-            // ANSI-style headers: the direction keyword applies to every following identifier
-            // until the next direction keyword (e.g. "input a, b, output y, z")
-            std::string direction;
-            bool isVector = false;
-            int msb = 0, lsb = 0;
-            while (i < tokens.size() && tokens[i].value != ";") {
-                const std::string& val = tokens[i].value;
-                if (val == "input" || val == "output") {
-                    direction = val;
-                    isVector = false;
-                } else if (val == "[") {
-                    // Range applies to all following names of the current direction
-                    isVector = parseRange(tokens, i, msb, lsb);
-                    continue;
-                } else if (val != "," && val != "(" && val != ")" && val != "wire" && val != "reg") {
-                    if (direction == "input") declareNets(m_inputs, val, isVector, msb, lsb);
-                    else if (direction == "output") declareNets(m_outputs, val, isVector, msb, lsb);
-                }
-                i++;
-            }
-        } else if (tokens[i].value == "input" || tokens[i].value == "output" || tokens[i].value == "wire") {
-            std::string type = tokens[i].value;
-            size_t startLine = tokens[i].line;
-            size_t startCol = tokens[i].column;
-            i++; // Advance past 'input'/'output'/'wire'
-            
-            bool closedCleanly = false;
-            bool isVector = false;
-            int msb = 0, lsb = 0;
-            while (i < tokens.size()) {
-                if (tokens[i].value == ";") {
-                    closedCleanly = true;
-                    break;
-                }
-                
-                // REPAIR: If we hit a gate primitive or another keyword inside the wire block,
-                // it implies the previous statement wasn't closed with a semicolon.
-                std::string val = tokens[i].value;
-                if (val == "and"  || val == "or"  || val == "xor" || val == "nand" ||
-                    val == "nor"  || val == "xnor" || val == "buf" || val == "not"  ||
-                    val == "wire" || val == "input"|| val == "output"|| val == "endmodule" || val == "assign") {
-                    break; // Force-break to trigger the Unterminated SyntaxException below
-                }
-
-                if (val == "[") {
-                    isVector = parseRange(tokens, i, msb, lsb);
-                    continue;
-                }
-
-                if (tokens[i].value != ",") {
-                    if (type == "input") declareNets(m_inputs, val, isVector, msb, lsb);
-                    else if (type == "output") declareNets(m_outputs, val, isVector, msb, lsb);
-                    else if (type == "wire") declareNets(m_wires, val, isVector, msb, lsb);
-                }
-                i++;
-            }
-            if (!closedCleanly) {
-                throw SyntaxException("Unterminated keyword block sequence, expected terminal ';'", startLine, startCol);
-            }
-        } else if (tokens[i].value == "and" || tokens[i].value == "or" || tokens[i].value == "xor" ||
-                   tokens[i].value == "nand" || tokens[i].value == "nor" || tokens[i].value == "xnor" ||
-                   tokens[i].value == "buf" || tokens[i].value == "not") {
-            
-            Gate gate;
-            gate.type = stringToGateType(tokens[i].value, tokens[i].line, tokens[i].column);
-            i++; 
-
-            if (i >= tokens.size() || tokens[i].value == "(") {
-                throw SyntaxException("Anonymous gate instantiation block discovered. Gate name required", tokens[i-1].line, tokens[i-1].column);
-            }
-            
-            gate.name = tokens[i].value;
-            i++; 
-            
-            if (i >= tokens.size() || tokens[i].value != "(") {
-                // Fall back to the last valid token when the input ends right after the gate name
-                const Token& errTok = (i < tokens.size()) ? tokens[i] : tokens[i-1];
-                throw SyntaxException("Expected pin list opening boundary wrapper '('", errTok.line, errTok.column);
-            }
-            i++;
-
-            std::vector<std::string> gateWires;
-            while (i < tokens.size() && tokens[i].value != ")") {
-                if (tokens[i].value == ",") {
-                    i++;
-                    continue;
-                }
-                gateWires.push_back(parseNetRef(tokens, i)); // Accepts scalar nets and bit selects "a[0]"
-            }
-            
-            if (i >= tokens.size() || tokens[i].value != ")") {
-                // REPAIR: Use the active token tracking metrics instead of the gate structure fields
-                throw SyntaxException("Unbalanced syntax encapsulation, missing wire closing boundary wrapper ')'", tokens[i-1].line, tokens[i-1].column); 
-            }
-            i++; // Advance beyond ')'
-
-            if (i >= tokens.size() || tokens[i].value != ";") {
-                throw SyntaxException("Missing required instruction termination sequence operator ';'", tokens[i-1].line, tokens[i-1].column);
-            }
-
-            if (gateWires.empty()) {
-                throw SyntaxException("Empty component structural net connections mapping inside pin list instantiation", tokens[i].line, tokens[i].column);
-            }
-            
-            // Safe multi-port checking using robust vector boundary assertions
-            gate.outputWire = gateWires.at(0);
-            for (size_t k = 1; k < gateWires.size(); ++k) {
-                gate.inputWires.push_back(gateWires.at(k));
-            }
-            m_gates.push_back(gate);
-        } else if (tokens[i].value == "assign") {
-            // Continuous assignment: "assign lhs = <boolean expression>;" is lowered into gates
-            size_t line = tokens[i].line;
-            i++;
-            std::string lhs = parseNetRef(tokens, i);
-
-            if (i >= tokens.size() || tokens[i].value != "=") {
-                const Token& errTok = tokenAt(tokens, i);
-                throw SyntaxException("Expected '=' in continuous assignment", errTok.line, errTok.column);
-            }
-            i++;
-
-            size_t gatesBefore = m_gates.size();
-            std::string rhs = parseOrExpr(tokens, i, line);
-
-            if (i >= tokens.size() || tokens[i].value != ";") {
-                const Token& errTok = tokenAt(tokens, i);
-                throw SyntaxException("Missing required instruction termination sequence operator ';'", errTok.line, errTok.column);
-            }
-
-            if (m_gates.size() > gatesBefore && m_gates.back().outputWire == rhs) {
-                // The expression's root gate drives the target directly, no extra buffer needed
-                m_wireStates.erase(rhs);
-                m_gates.back().outputWire = lhs;
-            } else {
-                // Plain net-to-net assignment ("assign y = w;") becomes a buffer
-                ++m_assignCounter;
-                m_gates.push_back({"assign_L" + std::to_string(line) + "_" + std::to_string(m_assignCounter),
-                                   GateType::BUF, lhs, {rhs}});
-            }
-            m_wireStates.try_emplace(lhs, LogicState::HighImpedance);
-        }
-        i++;
-    }
-    return true;
+void Parser::fail(const std::string& message, const Token& at) const {
+    throw SyntaxException(message, at.line, at.column);
 }
-
-// Logic evaluation and accessors remain identical, guarding runtime execution flows
-LogicState Parser::evaluateGate(GateType type, const std::vector<LogicState>& inputs) const {
-    if (inputs.empty()) return LogicState::HighImpedance;
-    for (auto state : inputs) {
-        if (state == LogicState::HighImpedance) return LogicState::HighImpedance;
-    }
-    auto to_bool = [](LogicState s) { return s == LogicState::LogicHigh; };
-    auto to_state = [](bool b) { return b ? LogicState::LogicHigh : LogicState::LogicLow; };
-
-    switch (type) {
-        case GateType::AND:  { bool res = true;  for (auto in : inputs) res &= to_bool(in); return to_state(res); }
-        case GateType::OR:   { bool res = false; for (auto in : inputs) res |= to_bool(in); return to_state(res); }
-        case GateType::XOR:  { bool res = false; for (auto in : inputs) res ^= to_bool(in); return to_state(res); }
-        case GateType::NAND: { bool res = true;  for (auto in : inputs) res &= to_bool(in); return to_state(!res); }
-        case GateType::NOR:  { bool res = false; for (auto in : inputs) res |= to_bool(in); return to_state(!res); }
-        case GateType::XNOR: { bool res = false; for (auto in : inputs) res ^= to_bool(in); return to_state(!res); }
-        case GateType::BUF:  return inputs.at(0);
-        case GateType::NOT:  return to_state(!to_bool(inputs.at(0)));
-    }
-    return LogicState::HighImpedance;
-}
-
-void Parser::evaluateCircuit() {
-    bool changed = true;
-    int maxIterations = 100; // Prevent infinite loops in cyclic combinational paths
-
-    while (changed && maxIterations-- > 0) {
-        changed = false;
-        
-        for (const auto& gate : m_gates) {
-            std::vector<LogicState> inputStates;
-            
-            // Extract and verify input wire states defensively
-            for (const auto& inWire : gate.inputWires) {
-                auto it = m_wireStates.find(inWire);
-                if (it == m_wireStates.end()) {
-                    // Fallback registration if the wire declaration was skipped or missed
-                    m_wireStates[inWire] = LogicState::HighImpedance;
-                    inputStates.push_back(LogicState::HighImpedance);
-                } else {
-                    inputStates.push_back(it->second);
-                }
-            }
-            
-            // Compute the output tri-state value based on the gate logic table
-            LogicState newOutput = evaluateGate(gate.type, inputStates);
-            
-            // Read current output state safely using the map iterator
-            auto outIt = m_wireStates.find(gate.outputWire);
-            if (outIt == m_wireStates.end()) {
-                // Wire didn't exist in mapping; initialize and trigger propagation change
-                m_wireStates[gate.outputWire] = newOutput;
-                changed = true;
-            } else if (outIt->second != newOutput) {
-                // Wire state flipped; update value and reinforce simulation loop
-                outIt->second = newOutput;
-                changed = true;
-            }
-        }
-    }
-}
-
-void Parser::setInputState(const std::string& inputName, LogicState state) { m_wireStates.at(inputName) = state; }
-LogicState Parser::getWireState(const std::string& wireName) const { return m_wireStates.at(wireName); }
 
 } // namespace MiniEDA
