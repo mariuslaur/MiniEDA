@@ -4,9 +4,12 @@
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QGraphicsTextItem>
+#include <QPainterPath>
 #include <fstream>
 #include <sstream>
 #include <map>
+#include <set>
+#include <cmath>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     auto *centralWidget = new QWidget(this);
@@ -18,10 +21,10 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 
     editor = new QTextEdit(this);
     editor->setPlaceholderText("// Write here or open file with verilog code...");
-    
+
     auto *btnOpen = new QPushButton("Open File", this);
     auto *btnSimulate = new QPushButton("Simulate", this);
-    
+
     leftLayout->addWidget(editor);
     leftLayout->addWidget(btnOpen);
     leftLayout->addWidget(btnSimulate);
@@ -42,7 +45,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         try {
             // Parse the in-memory string directly using our optimized defensive engine
             this->m_parser.parseNetlist(verilogCode);
-            
+
             if (this->m_parser.getGates().empty()) {
                 QMessageBox::warning(this, "Simulation Notice", "The syntax is valid, but no structural logic gates were discovered to simulate.");
                 return;
@@ -52,7 +55,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
             this->m_parser.evaluateCircuit();
 
             // Render the graphical scene mapping using viewport geometry recalculations
-            this->renderCircuit(); 
+            this->renderCircuit();
 
         } catch (const MiniEDA::SyntaxException& ex) {
             // Catch precision syntax coordinates and feed them back directly into the UI layer
@@ -69,8 +72,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 }
 
 MainWindow::~MainWindow() {
-    // Left blank intentionally. 
-    // Qt's parent-child object tree automatically deletes all child widgets, 
+    // Left blank intentionally.
+    // Qt's parent-child object tree automatically deletes all child widgets,
     // and m_parser is automatically cleaned up as a stack-allocated member.
 }
 
@@ -84,7 +87,7 @@ void MainWindow::openFile() {
         buffer << file.rdbuf();
         editor->setText(QString::fromStdString(buffer.str()));
         file.close();
-        
+
         try {
             // Directly load and process the opened file buffer inside the parser instance
             m_parser.parseNetlist(buffer.str());
@@ -102,9 +105,6 @@ void MainWindow::openFile() {
 
 void MainWindow::renderCircuit() {
     scene->clear();
-    
-    // Local tracking map for wire connection layout paths
-    std::map<std::string, QPointF> pinPositions;
 
     // Helper lambda to map the modern strongly-typed GateType enum back to raw UI display strings
     auto gateTypeToString = [](MiniEDA::GateType type) -> std::string {
@@ -126,54 +126,154 @@ void MainWindow::renderCircuit() {
     const int padding = 60;
     const int gateWidth = 180;
     const int gateHeight = 65;
+    const qreal trackSpacing = 14.0;      // Minimal distance between two parallel wire tracks
+    const qreal minChannelWidth = 150.0;  // Routing channel width when only a few tracks are needed
 
-    size_t numInputs  = m_parser.getInputs().size();
-    size_t numGates   = m_parser.getGates().size();
-    size_t numOutputs = m_parser.getOutputs().size();
+    const auto& inputs  = m_parser.getInputs();
+    const auto& gates   = m_parser.getGates();
+    const auto& outputs = m_parser.getOutputs();
+
+    size_t numInputs  = inputs.size();
+    size_t numGates   = gates.size();
+    size_t numOutputs = outputs.size();
+
+    // ---- 1. Net topology classification (independent of geometry) ----
+    // Each net gets exactly one vertical track per channel, so different nets can never overlap.
+    struct PinRef { size_t gate; size_t pin; };
+
+    std::map<std::string, size_t> driverGate; // wire -> index of the gate driving it
+    for (size_t g = 0; g < numGates; ++g) driverGate[gates[g].outputWire] = g;
+    std::set<std::string> inputSet(inputs.begin(), inputs.end());
+
+    std::map<std::string, std::vector<PinRef>> inputNetPins; // module input -> gate input pins
+    std::map<std::string, std::vector<PinRef>> g2gNetPins;   // gate output  -> gate input pins
+    for (size_t g = 0; g < numGates; ++g) {
+        for (size_t idx = 0; idx < gates[g].inputWires.size(); ++idx) {
+            const auto& wire = gates[g].inputWires[idx];
+            if (driverGate.count(wire)) g2gNetPins[wire].push_back({g, idx});
+            else if (inputSet.count(wire)) inputNetPins[wire].push_back({g, idx});
+        }
+    }
+
+    // Track order: inputs top-to-bottom, gate nets by driver gate, outputs top-to-bottom
+    std::vector<std::string> inputNets, g2gNets, outNets;
+    for (const auto& in : inputs) if (inputNetPins.count(in)) inputNets.push_back(in);
+    for (const auto& gate : gates) if (g2gNetPins.count(gate.outputWire)) g2gNets.push_back(gate.outputWire);
+    for (const auto& out : outputs) if (driverGate.count(out)) outNets.push_back(out);
+
+    // Gate-to-gate nets bypass the gate column over the top or under the bottom, each on its own gutter
+    qreal midGate = (static_cast<qreal>(numGates) - 1.0) / 2.0;
+    std::map<std::string, bool> g2gViaTop;
+    std::map<std::string, size_t> g2gBypassIdx;
+    size_t numTop = 0, numBot = 0;
+    for (const auto& net : g2gNets) {
+        qreal sum = static_cast<qreal>(driverGate[net]);
+        for (const auto& pin : g2gNetPins[net]) sum += pin.gate;
+        bool viaTop = sum / (g2gNetPins[net].size() + 1.0) <= midGate;
+        g2gViaTop[net] = viaTop;
+        g2gBypassIdx[net] = viaTop ? numTop++ : numBot++;
+    }
+
+    // ---- 2. Module geometry, widened/heightened to fit all tracks and bypass gutters ----
+    // Left channel:  [input tracks ... | gate-to-gate left tracks]
+    // Right channel: [gate-to-gate right tracks | output tracks ...]
+    size_t leftTracks  = inputNets.size() + g2gNets.size();
+    size_t rightTracks = g2gNets.size() + outNets.size();
+    qreal leftChannelWidth  = std::max(minChannelWidth, (leftTracks + 1) * trackSpacing);
+    qreal rightChannelWidth = std::max(minChannelWidth, (rightTracks + 1) * trackSpacing);
 
     // Max number of column elements will drive the module graphical height boundary rules
     size_t maxElements = std::max({numInputs, numGates, numOutputs});
     if (maxElements == 0) maxElements = 1;
 
-    qreal moduleWidth = 480;
-    qreal moduleHeight = (maxElements * itemSpacing) + (padding * 2) - 30;
+    qreal topExtra = numTop * trackSpacing;
+    qreal botExtra = numBot * trackSpacing;
+    qreal innerHeight = (maxElements * itemSpacing) + (padding * 2) - 30;
+
+    qreal moduleWidth = leftChannelWidth + gateWidth + rightChannelWidth;
+    qreal moduleHeight = innerHeight + topExtra + botExtra;
 
     qreal viewWidth = view->width() > 0 ? view->width() : 1000;
     qreal viewHeight = view->height() > 0 ? view->height() : 600;
 
-    qreal moduleX = (viewWidth - moduleWidth) / 2.0;
+    qreal moduleX = std::max(80.0, (viewWidth - moduleWidth) / 2.0);
     qreal moduleY = std::max(20.0, (viewHeight - moduleHeight) / 2.0);
+    qreal innerY = moduleY + topExtra;
 
-    scene->setSceneRect(0, 0, viewWidth, std::max(viewHeight, moduleY + moduleHeight + 50));
+    qreal gateLeftX = moduleX + leftChannelWidth;
+    qreal gateRightX = gateLeftX + gateWidth;
+    qreal moduleRightX = moduleX + moduleWidth;
+
+    scene->setSceneRect(0, 0, std::max(viewWidth, moduleRightX + 120), std::max(viewHeight, moduleY + moduleHeight + 50));
 
     // Adaptive structural frame background module rendering
-    scene->addRect(moduleX, moduleY, moduleWidth, moduleHeight, 
+    scene->addRect(moduleX, moduleY, moduleWidth, moduleHeight,
                     QPen(QColor(80, 80, 80), 2, Qt::DashLine), QBrush(QColor(253, 253, 253)));
-    
+
     auto *moduleTitle = scene->addText("Module: TopLevelNetlist (Adaptive Internal View)");
     moduleTitle->setFont(QFont("Arial", 11, QFont::Bold));
     moduleTitle->setPos(moduleX + 15, moduleY + 10);
 
-    // Interactive module inputs generation loop (centered along the left side boundary)
-    qreal inputStartY = moduleY + padding + ((moduleHeight - (padding * 2) - ((numInputs - 1) * itemSpacing)) / 2.0);
-    if (numInputs <= 1) inputStartY = moduleY + (moduleHeight / 2.0) - 15;
+    // Vertical start of a column of `count` items, centered inside the inner module area
+    auto columnStartY = [&](size_t count, qreal itemHeight) -> qreal {
+        if (count <= 1) return innerY + (innerHeight / 2.0) - (itemHeight / 2.0);
+        return innerY + padding + ((innerHeight - (padding * 2) - ((count - 1) * itemSpacing)) / 2.0);
+    };
+
+    qreal gateStartY = columnStartY(numGates, gateHeight);
+    auto gateTopY = [&](size_t g) -> qreal { return gateStartY + (g * itemSpacing); };
+    auto gateInputPin = [&](size_t g, size_t idx) -> QPointF {
+        // Distribute input pins evenly across gate height
+        size_t totalPins = gates[g].inputWires.size();
+        qreal pinOffset = totalPins == 1 ? (gateHeight / 2.0) : (gateHeight * (idx + 1) / (totalPins + 1.0));
+        return QPointF(gateLeftX, gateTopY(g) + pinOffset);
+    };
+    auto gateOutputPin = [&](size_t g) -> QPointF {
+        return QPointF(gateRightX, gateTopY(g) + (gateHeight / 2.0));
+    };
+
+    // Shifts a module port slightly when its horizontal stub would be collinear with a stub of another net
+    auto nudgeOffset = [](qreal pinY, const std::vector<qreal>& foreignYs) -> qreal {
+        for (qreal offset : {0.0, 10.0, -10.0, 20.0, -20.0}) {
+            bool clash = false;
+            for (qreal y : foreignYs) {
+                if (std::abs(pinY + offset - y) < 4.0) { clash = true; break; }
+            }
+            if (!clash) return offset;
+        }
+        return 0.0;
+    };
+
+    // ---- 3. Interactive module inputs (centered along the left side boundary) ----
+    std::map<std::string, qreal> inputPinY;
+    qreal inputStartY = columnStartY(numInputs, 30);
 
     for (size_t i = 0; i < numInputs; ++i) {
-        std::string input = m_parser.getInputs().at(i);
-        
+        std::string input = inputs.at(i);
+
         // Initialize default high-impedance state into the logic engine securely
         m_parser.setInputState(input, MiniEDA::LogicState::HighImpedance);
 
+        std::vector<qreal> foreignPinYs;
+        for (size_t g = 0; g < numGates; ++g) {
+            for (size_t idx = 0; idx < gates[g].inputWires.size(); ++idx) {
+                if (gates[g].inputWires[idx] != input) foreignPinYs.push_back(gateInputPin(g, idx).y());
+            }
+        }
+
         qreal currY = inputStartY + (i * itemSpacing);
+        currY += nudgeOffset(currY + 15, foreignPinYs);
 
         auto *inputItem = new InteractiveInputItem(input, moduleX - 60, currY);
         inputItem->setData(3, "INPUT");
         scene->addItem(inputItem);
 
         auto *text = scene->addText(QString::fromStdString(input + " (Z)"));
+        text->setData(0, QString::fromStdString(input));
+        text->setData(3, "INPUT_LABEL");
         text->setPos(moduleX - 55, currY + 2);
 
-        pinPositions[input] = QPointF(moduleX, currY + 15);
+        inputPinY[input] = currY + 15;
 
         // UI trigger event mapping input item values back to the core tri-state logic engine
         inputItem->onClickCallback = [this, inputItem, text, input]() {
@@ -190,81 +290,130 @@ void MainWindow::renderCircuit() {
 
             this->m_parser.setInputState(input, state);
             text->setPlainText(QString::fromStdString(input) + stateStr);
-            
+
             // Re-run the global structural bitwise logic propagation layers
             this->runSimulation();
         };
     }
 
-    // Internal structural logic gates placement loops (centered inside the module canvas frame)
-    qreal gateStartY = moduleY + padding + ((moduleHeight - (padding * 2) - ((numGates - 1) * itemSpacing)) / 2.0);
-    if (numGates <= 1) gateStartY = moduleY + (moduleHeight / 2.0) - (gateHeight / 2.0);
-
+    // ---- 4. Internal structural logic gates (centered inside the module canvas frame) ----
     for (size_t i = 0; i < numGates; ++i) {
-        const auto& gate = m_parser.getGates().at(i);
+        const auto& gate = gates.at(i);
         std::string gateTypeStr = gateTypeToString(gate.type);
-        qreal currY = gateStartY + (i * itemSpacing);
+        qreal currY = gateTopY(i);
 
-        auto *gateRect = scene->addRect(moduleX + 150, currY, gateWidth, gateHeight, QPen(Qt::darkBlue, 2), QBrush(QColor(240, 248, 255)));
-        
+        auto *gateRect = scene->addRect(gateLeftX, currY, gateWidth, gateHeight, QPen(Qt::darkBlue, 2), QBrush(QColor(240, 248, 255)));
+
         gateRect->setData(0, QString::fromStdString(gate.name));
         gateRect->setData(1, QString::fromStdString(gateTypeStr));
         gateRect->setData(2, QString::fromStdString(gate.outputWire));
         gateRect->setData(3, "GATE");
 
-        auto *gateText = scene->addText(QString::fromStdString(gateTypeStr + ": " + gate.name + "\nIn: [Z, Z]\nOut: Z"));
+        std::string pinsZ;
+        for (size_t p = 0; p < gate.inputWires.size(); ++p) pinsZ += (p ? ", Z" : "Z");
+        auto *gateText = scene->addText(QString::fromStdString(gateTypeStr + ": " + gate.name + "\nIn: [" + pinsZ + "]\nOut: Z"));
         gateText->setFont(QFont("Courier New", 9));
-        gateText->setPos(moduleX + 155, currY + 5);
+        gateText->setPos(gateLeftX + 5, currY + 5);
         gateText->setParentItem(gateRect);
-
-        // Capture component physical output pin mapping position details safely
-        pinPositions[gate.outputWire] = QPointF(moduleX + 150 + gateWidth, currY + (gateHeight / 2.0));
     }
 
-    // Module structural outputs generation loop (centered along the right side boundary)
-    qreal outStartY = moduleY + padding + ((moduleHeight - (padding * 2) - ((numOutputs - 1) * itemSpacing)) / 2.0);
-    if (numOutputs <= 1) outStartY = moduleY + (moduleHeight / 2.0) - 15;
+    // ---- 5. Module structural outputs (centered along the right side boundary) ----
+    std::map<std::string, qreal> outputPinY;
+    qreal outStartY = columnStartY(numOutputs, 30);
 
     for (size_t i = 0; i < numOutputs; ++i) {
-        std::string output = m_parser.getOutputs().at(i);
-        qreal currY = outStartY + (i * itemSpacing);
+        std::string output = outputs.at(i);
 
-        auto *outItem = new VisualOutputItem(output, moduleX + moduleWidth, currY);
+        std::vector<qreal> foreignOutYs;
+        for (size_t g = 0; g < numGates; ++g) {
+            if (gates[g].outputWire != output) foreignOutYs.push_back(gateOutputPin(g).y());
+        }
+
+        qreal currY = outStartY + (i * itemSpacing);
+        currY += nudgeOffset(currY + 15, foreignOutYs);
+
+        auto *outItem = new VisualOutputItem(output, moduleRightX, currY);
         outItem->setData(0, QString::fromStdString(output));
         outItem->setData(3, "OUTPUT");
         scene->addItem(outItem);
 
         auto *outText = scene->addText(QString::fromStdString(output + " (Z)"));
-        outText->setPos(moduleX + moduleWidth + 5, currY + 2);
+        outText->setData(0, QString::fromStdString(output));
+        outText->setData(3, "OUTPUT_LABEL");
+        outText->setPos(moduleRightX + 5, currY + 2);
 
-        pinPositions["OUT_" + output] = QPointF(moduleX + moduleWidth, currY + 15);
+        outputPinY[output] = currY + 15;
     }
 
-    // Inter-wire structural trace routing generation loops
-    for (size_t i = 0; i < numGates; ++i) {
-        const auto& gate = m_parser.getGates().at(i);
-        qreal currY = gateStartY + (i * itemSpacing);
+    // ---- 6. Channel-based orthogonal routing: one dedicated track per net, no gate crossings ----
+    qreal leftStep  = leftChannelWidth / (leftTracks + 1.0);
+    qreal rightStep = rightChannelWidth / (rightTracks + 1.0);
+    auto leftTrackX  = [&](size_t k) -> qreal { return moduleX + (k + 1) * leftStep; };
+    auto rightTrackX = [&](size_t k) -> qreal { return gateRightX + (k + 1) * rightStep; };
 
-        int idx = 0;
-        for (const auto& inputWire : gate.inputWires) {
-            if (pinPositions.count(inputWire)) {
-                QPointF startPoint = pinPositions[inputWire];
-                // Input pin wire geometric routing offsets mapping
-                QPointF endPoint(moduleX + 150, currY + (idx == 0 ? 18 : 48));
+    auto addNetPath = [this](const QPainterPath& path, const std::string& net) {
+        auto *pathItem = scene->addPath(path, QPen(QColor(255, 165, 0), 2));
+        pathItem->setData(0, QString::fromStdString(net));
+    };
 
-                auto *lineItem = scene->addLine(QLineF(startPoint, endPoint), QPen(QColor(255, 165, 0), 2));
-                lineItem->setData(0, QString::fromStdString(inputWire));
+    // 6.1 Primary inputs -> gate inputs (outer part of the left channel)
+    for (size_t k = 0; k < inputNets.size(); ++k) {
+        const auto& net = inputNets[k];
+        QPointF src(moduleX, inputPinY[net]);
+        qreal trackX = leftTrackX(k);
+
+        QPainterPath path;
+        for (const auto& pin : inputNetPins[net]) {
+            QPointF dst = gateInputPin(pin.gate, pin.pin);
+            path.moveTo(src);
+            path.lineTo(trackX, src.y()); // 1. Horizontal from source to the net's track
+            path.lineTo(trackX, dst.y()); // 2. Vertical along the dedicated track
+            path.lineTo(dst);             // 3. Horizontal to destination pin
+        }
+        addNetPath(path, net);
+    }
+
+    // 6.2 Gate-to-gate connections: right pin -> right corridor -> top/bottom gutter -> left corridor -> left pin
+    if (!g2gNets.empty()) {
+        qreal topBypassBase = gateStartY - 25.0;
+        qreal botBypassBase = gateTopY(numGates - 1) + gateHeight + 25.0;
+
+        for (size_t j = 0; j < g2gNets.size(); ++j) {
+            const auto& net = g2gNets[j];
+            QPointF src = gateOutputPin(driverGate[net]);
+            qreal rightX = rightTrackX(j);
+            qreal leftX  = leftTrackX(inputNets.size() + j);
+            size_t bypassIdx = g2gBypassIdx[net];
+            qreal bypassY = g2gViaTop[net] ? (topBypassBase - bypassIdx * trackSpacing)
+                                           : (botBypassBase + bypassIdx * trackSpacing);
+
+            QPainterPath path;
+            for (const auto& pin : g2gNetPins[net]) {
+                QPointF dst = gateInputPin(pin.gate, pin.pin);
+                path.moveTo(src);
+                path.lineTo(rightX, src.y()); // Step 1: Exit gate rightwards into right corridor
+                path.lineTo(rightX, bypassY); // Step 2: Traverse vertically up/down outside gate bounds
+                path.lineTo(leftX, bypassY);  // Step 3: Bypass horizontally above/below all gates
+                path.lineTo(leftX, dst.y());  // Step 4: Traverse vertically in left corridor
+                path.lineTo(dst);             // Step 5: Enter destination gate input pin from the left
             }
-            idx++;
+            addNetPath(path, net);
         }
+    }
 
-        if (pinPositions.count("OUT_" + gate.outputWire)) {
-            QPointF startPoint = pinPositions[gate.outputWire];
-            QPointF endPoint = pinPositions["OUT_" + gate.outputWire];
+    // 6.3 Gate outputs -> primary outputs (outer part of the right channel)
+    for (size_t k = 0; k < outNets.size(); ++k) {
+        const auto& net = outNets[k];
+        QPointF src = gateOutputPin(driverGate[net]);
+        QPointF dst(moduleRightX, outputPinY[net]);
+        qreal trackX = rightTrackX(g2gNets.size() + k);
 
-            auto *lineItem = scene->addLine(QLineF(startPoint, endPoint), QPen(QColor(255, 165, 0), 2));
-            lineItem->setData(0, QString::fromStdString(gate.outputWire));
-        }
+        QPainterPath path;
+        path.moveTo(src);
+        path.lineTo(trackX, src.y());
+        path.lineTo(trackX, dst.y());
+        path.lineTo(dst);
+        addNetPath(path, net);
     }
 
     // Trigger state evaluation and update UI visual nodes values mapping
@@ -285,21 +434,20 @@ void MainWindow::runSimulation() {
     // Update the graphical objects dynamically based on the newly calculated backend states
     QList<QGraphicsItem*> itemsList = scene->items();
     for (auto* item : itemsList) {
-        
         // 1. Trace wire lines color and thickness updates
-        if (item->type() == QGraphicsLineItem::Type && !item->data(0).toString().isEmpty()) {
+        if (item->type() == QGraphicsPathItem::Type && !item->data(0).toString().isEmpty()) {
             std::string wireName = item->data(0).toString().toStdString();
-            
+
             // Defensively pull the state from the memory graph using safe map queries
             MiniEDA::LogicState val = m_parser.getWireState(wireName);
-            auto* line = static_cast<QGraphicsLineItem*>(item);
-            
+            auto* pathItem = static_cast<QGraphicsPathItem*>(item);
+
             if (val == MiniEDA::LogicState::LogicHigh) {
-                line->setPen(QPen(QColor(255, 90, 90), 3));   // (1) Solid Red
+                pathItem->setPen(QPen(QColor(255, 90, 90), 3));   // (1) Solid Red
             } else if (val == MiniEDA::LogicState::LogicLow) {
-                line->setPen(QPen(QColor(65, 105, 225), 3));  // (0) Solid Blue
+                pathItem->setPen(QPen(QColor(65, 105, 225), 3));  // (0) Solid Blue
             } else {
-                line->setPen(QPen(QColor(255, 165, 0), 2));   // (Z) Thin High-Impedance Orange
+                pathItem->setPen(QPen(QColor(255, 165, 0), 2));   // (Z) Thin High-Impedance Orange
             }
         }
 
@@ -309,17 +457,13 @@ void MainWindow::runSimulation() {
             QString gType = item->data(1).toString();
             QString gOutput = item->data(2).toString();
 
-            MiniEDA::LogicState p1 = MiniEDA::LogicState::HighImpedance;
-            MiniEDA::LogicState p2 = MiniEDA::LogicState::HighImpedance;
-
-            // Search for current matching component configurations to correctly display inputs
+            // Search for current matching component configurations to correctly display all inputs
+            QString pinStates;
             for (const auto& gate : m_parser.getGates()) {
                 if (gate.name == gName.toStdString()) {
-                    if (gate.inputWires.size() > 0) {
-                        p1 = m_parser.getWireState(gate.inputWires.at(0));
-                    }
-                    if (gate.inputWires.size() > 1) {
-                        p2 = m_parser.getWireState(gate.inputWires.at(1));
+                    for (size_t p = 0; p < gate.inputWires.size(); ++p) {
+                        if (p > 0) pinStates += ", ";
+                        pinStates += QString::fromStdString(formatPinState(m_parser.getWireState(gate.inputWires.at(p))));
                     }
                     break;
                 }
@@ -327,7 +471,7 @@ void MainWindow::runSimulation() {
 
             MiniEDA::LogicState finalOut = m_parser.getWireState(gOutput.toStdString());
             auto* rect = static_cast<QGraphicsRectItem*>(item);
-            
+
             if (finalOut == MiniEDA::LogicState::LogicHigh) {
                 rect->setBrush(QBrush(QColor(152, 251, 152))); // (1) High-state Soft Green
             } else if (finalOut == MiniEDA::LogicState::LogicLow) {
@@ -341,7 +485,7 @@ void MainWindow::runSimulation() {
                 auto* textItem = qgraphicsitem_cast<QGraphicsTextItem*>(children.first());
                 if (textItem) {
                     QString statusText = gType.toUpper() + ": " + gName + "\n" +
-                                         "In:  [" + QString::fromStdString(formatPinState(p1)) + ", " + QString::fromStdString(formatPinState(p2)) + "]\n" +
+                                         "In:  [" + pinStates + "]\n" +
                                          "Out: [" + QString::fromStdString(formatPinState(finalOut)) + "]";
                     textItem->setPlainText(statusText);
                 }
@@ -362,11 +506,13 @@ void MainWindow::runSimulation() {
                 rect->setBrush(QBrush(QColor(255, 222, 173))); // (Z) Orange
             }
 
-            // Sync structural label texts rendered inside the viewport
+            // Sync the label belonging to exactly this output (matched by tag, not by text prefix)
             for (auto* sibling : scene->items()) {
+                if (sibling->data(3).toString() != "OUTPUT_LABEL" ||
+                    sibling->data(0).toString().toStdString() != outName) continue;
+
                 auto* textItem = qgraphicsitem_cast<QGraphicsTextItem*>(sibling);
-                if (textItem && textItem->parentItem() == nullptr && 
-                    textItem->toPlainText().startsWith(QString::fromStdString(outName))) {
+                if (textItem) {
                     QString status = QString::fromStdString(outName) + " (" + QString::fromStdString(formatPinState(finalOut)) + ")";
                     textItem->setPlainText(status);
                 }

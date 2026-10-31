@@ -3,6 +3,7 @@
 #include <vector>
 #include <unordered_map>
 #include <stdexcept>
+#include <utility>
 
 namespace MiniEDA {
 
@@ -72,7 +73,24 @@ private:
 
     LogicState evaluateGate(GateType type, const std::vector<LogicState>& inputs) const;
     GateType stringToGateType(const std::string& gateStr, size_t line, size_t col) const;
-    
+
+    // Registers a net name into the given port list (no duplicates) and initializes its state to Z
+    void addPort(std::vector<std::string>& list, const std::string& name);
+
+    // Vector support: "[msb:lsb] name" declarations are expanded into scalar bit nets "name[k]"
+    std::unordered_map<std::string, std::pair<int, int>> m_vectorRanges;
+    void declareNets(std::vector<std::string>& list, const std::string& name, bool isVector, int msb, int lsb);
+    bool parseRange(const std::vector<Token>& tokens, size_t& i, int& msb, int& lsb) const;
+    std::string parseNetRef(const std::vector<Token>& tokens, size_t& i) const;
+
+    // Continuous assignment lowering: boolean expressions become gates driving temporary nets
+    size_t m_assignCounter = 0;
+    std::string parseOrExpr(const std::vector<Token>& tokens, size_t& i, size_t line);
+    std::string parseXorExpr(const std::vector<Token>& tokens, size_t& i, size_t line);
+    std::string parseAndExpr(const std::vector<Token>& tokens, size_t& i, size_t line);
+    std::string parseUnaryExpr(const std::vector<Token>& tokens, size_t& i, size_t line);
+    std::string emitAssignGate(GateType type, const std::vector<std::string>& inputs, size_t line);
+
     // Updated to extract structural tokens with spatial metadata
     void tokenize(const std::string& code, std::vector<Token>& tokens) const;
 };

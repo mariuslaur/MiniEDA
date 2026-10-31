@@ -25,5 +25,13 @@ add_executable(parserTest
 target_include_directories(parserTest PRIVATE include)
 target_link_libraries(parserTest PRIVATE Qt6::Test Qt6::Widgets)
 
-# Înregistrăm testul în utilitarul CTest al CMake
-add_test(NAME MiniEDAParserTest COMMAND parserTest)
+# Înregistrăm fiecare funcție de test QtTest ca test separat în CTest.
+# Numele sunt extrase automat din declarațiile "void testX();" din parserTest.cpp,
+# iar CMake se reconfigurează singur când fișierul de test se modifică.
+set(PARSER_TEST_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/parserTest.cpp)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PARSER_TEST_SOURCE})
+file(STRINGS ${PARSER_TEST_SOURCE} PARSER_TEST_DECLS REGEX "^[ \t]*void[ \t]+test[A-Za-z0-9_]*[ \t]*\\([ \t]*\\)[ \t]*;")
+foreach(decl ${PARSER_TEST_DECLS})
+    string(REGEX REPLACE "^[ \t]*void[ \t]+(test[A-Za-z0-9_]*).*" "\\1" testName "${decl}")
+    add_test(NAME Parser.${testName} COMMAND parserTest ${testName})
+endforeach()

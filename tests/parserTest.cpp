@@ -8,6 +8,11 @@ private slots:
     void testNewGatesParsing();
     void testTriStateLogicPropagation();
     void testSyntaxErrorPositionTracking();
+    void testTruncatedGateDoesNotCrash();
+    void testCommentsAreIgnored();
+    void testAssignExpressions();
+    void testVectorsAndBitSelects();
+    void testCommentedDesignMatchesClean();
 };
 
 void ParserTest::testNewGatesParsing() {
@@ -22,6 +27,8 @@ void ParserTest::testNewGatesParsing() {
         "endmodule";
 
     QVERIFY(parser.parseNetlist(verilog));
+    QCOMPARE(parser.getInputs().size(), 2U);
+    QCOMPARE(parser.getOutputs().size(), 5U);
     QCOMPARE(parser.getGates().size(), 5U);
     QCOMPARE(parser.getGates().at(0).type, MiniEDA::GateType::NAND);
     QCOMPARE(parser.getGates().at(1).type, MiniEDA::GateType::NOR);
@@ -74,6 +81,7 @@ void ParserTest::testSyntaxErrorPositionTracking() {
     
     try {
         parser.parseNetlist(badVerilogSemicolon);
+        QFAIL("Expected SyntaxException");
     } catch (const MiniEDA::SyntaxException& ex) {
         QCOMPARE(ex.line(), 2U);
         QCOMPARE(ex.column(), 3U); // Starts exactly at the keyword block
@@ -87,10 +95,222 @@ void ParserTest::testSyntaxErrorPositionTracking() {
 
     try {
         parser.parseNetlist(badAnonymousGate);
+        QFAIL("Expected SyntaxException");
     } catch (const MiniEDA::SyntaxException& ex) {
         QCOMPARE(ex.line(), 2U);
         QCOMPARE(ex.rawMessage(), std::string("Anonymous gate instantiation block discovered. Gate name required"));
     }
+}
+
+void ParserTest::testTruncatedGateDoesNotCrash() {
+    MiniEDA::Parser parser;
+    // Input ends right after the gate instance name, no pin list
+    std::string truncated =
+        "module m (input a, output b);\n"
+        "  and g1";
+
+    QVERIFY_EXCEPTION_THROWN(parser.parseNetlist(truncated), MiniEDA::SyntaxException);
+}
+
+void ParserTest::testCommentsAreIgnored() {
+    MiniEDA::Parser parser;
+    std::string verilog =
+        "// header comment with and, or keywords\n"
+        "module m (\n"
+        "  // 2 distinct inputs\n"
+        "  input a, b,\n"
+        "  /* block\n"
+        "     comment */ output y\n"
+        ");\n"
+        "  and g1 (y, a, b); // trailing comment\n"
+        "  /* unterminated";
+
+    QVERIFY(parser.parseNetlist(verilog));
+    QCOMPARE(parser.getInputs().size(), 2U);
+    QCOMPARE(parser.getOutputs().size(), 1U);
+    QCOMPARE(parser.getOutputs().at(0), std::string("y"));
+    QCOMPARE(parser.getGates().size(), 1U);
+
+    // Line tracking must survive block comments spanning multiple lines
+    std::string bad =
+        "module m (input a, output y);\n"
+        "  /* line 2\n"
+        "     line 3 */\n"
+        "  wire w\n"
+        "  and g1 (y, a, w);\n"
+        "endmodule";
+    try {
+        parser.parseNetlist(bad);
+        QFAIL("Expected SyntaxException");
+    } catch (const MiniEDA::SyntaxException& ex) {
+        QCOMPARE(ex.line(), 4U);
+        QCOMPARE(ex.column(), 3U);
+    }
+}
+
+void ParserTest::testAssignExpressions() {
+    using MiniEDA::LogicState;
+    MiniEDA::Parser parser;
+    std::string verilog =
+        "module Dataflow (input a, b, c, d, output y, z, x, w, v);\n"
+        "  wire t;\n"
+        "  assign t = a;\n"                      // plain net assignment -> buffer
+        "  assign y = ~(a & b) | c ^ d;\n"       // precedence: ~() then ^ then |
+        "  assign x = a ~^ b ~^ c;\n"            // chained xnor: (a xnor b) xnor c
+        "  assign w = a && b || !c;\n"
+        "  assign v = t & b & c;\n"              // same operator chain -> one 3-input AND
+        "endmodule";
+
+    QVERIFY(parser.parseNetlist(verilog));
+    QCOMPARE(parser.getInputs().size(), 4U);
+    QCOMPARE(parser.getOutputs().size(), 5U);
+
+    const auto& gates = parser.getGates();
+    QCOMPARE(gates.at(0).type, MiniEDA::GateType::BUF);
+    QCOMPARE(gates.at(0).outputWire, std::string("t"));
+    QCOMPARE(gates.back().type, MiniEDA::GateType::AND);
+    QCOMPARE(gates.back().outputWire, std::string("v"));
+    QCOMPARE(gates.back().inputWires.size(), 3U);
+
+    parser.setInputState("a", LogicState::LogicHigh);
+    parser.setInputState("b", LogicState::LogicLow);
+    parser.setInputState("c", LogicState::LogicLow);
+    parser.setInputState("d", LogicState::LogicHigh);
+    parser.evaluateCircuit();
+
+    QCOMPARE(parser.getWireState("t"), LogicState::LogicHigh);
+    QCOMPARE(parser.getWireState("y"), LogicState::LogicHigh); // ~(1&0)=1 | (0^1)=1
+    QCOMPARE(parser.getWireState("x"), LogicState::LogicHigh); // (1 xnor 0)=0, 0 xnor 0 = 1
+    QCOMPARE(parser.getWireState("w"), LogicState::LogicHigh); // (1&&0)=0 || !0=1
+    QCOMPARE(parser.getWireState("v"), LogicState::LogicLow);  // 1&0&0
+
+    QVERIFY_EXCEPTION_THROWN(parser.parseNetlist("module m (input a, output y);\n  assign y = a\nendmodule"),
+                             MiniEDA::SyntaxException);
+    QVERIFY_EXCEPTION_THROWN(parser.parseNetlist("module m (input a, b, output y);\n  assign y = (a & b;\nendmodule"),
+                             MiniEDA::SyntaxException);
+    QVERIFY_EXCEPTION_THROWN(parser.parseNetlist("module m (input a, b, output y);\n  assign y = a & ;\nendmodule"),
+                             MiniEDA::SyntaxException);
+}
+
+void ParserTest::testVectorsAndBitSelects() {
+    using MiniEDA::LogicState;
+    MiniEDA::Parser parser;
+    std::string verilog =
+        "module dataflow_logic (\n"
+        "    input [1:0] a,\n"
+        "    input b,\n"
+        "    output y,\n"
+        "    output z\n"
+        ");\n"
+        "    wire [0:0] n;\n"
+        "    assign y = (a[0] & b) | (~a[1]);\n"
+        "    assign z = (a[0] ^ b) & y;\n"
+        "    not g1 (n[0], a[1]);\n"
+        "endmodule";
+
+    QVERIFY(parser.parseNetlist(verilog));
+    QCOMPARE(parser.getInputs().size(), 3U);
+    QCOMPARE(parser.getInputs().at(0), std::string("a[1]"));
+    QCOMPARE(parser.getInputs().at(1), std::string("a[0]"));
+    QCOMPARE(parser.getInputs().at(2), std::string("b"));
+
+    parser.setInputState("a[0]", LogicState::LogicHigh);
+    parser.setInputState("a[1]", LogicState::LogicLow);
+    parser.setInputState("b", LogicState::LogicHigh);
+    parser.evaluateCircuit();
+
+    QCOMPARE(parser.getWireState("y"), LogicState::LogicHigh); // (1&1) | ~0
+    QCOMPARE(parser.getWireState("z"), LogicState::LogicLow);  // (1^1) & 1
+    QCOMPARE(parser.getWireState("n[0]"), LogicState::LogicHigh);
+
+    // Bit select outside the declared range
+    QVERIFY_EXCEPTION_THROWN(parser.parseNetlist("module m (input [1:0] a, output y);\n  assign y = a[2];\nendmodule"),
+                             MiniEDA::SyntaxException);
+    // Whole-vector operand is not a 1-bit net
+    QVERIFY_EXCEPTION_THROWN(parser.parseNetlist("module m (input [1:0] a, output y);\n  assign y = a;\nendmodule"),
+                             MiniEDA::SyntaxException);
+    // Malformed range
+    QVERIFY_EXCEPTION_THROWN(parser.parseNetlist("module m (input [1 0] a, output y);\nendmodule"),
+                             MiniEDA::SyntaxException);
+}
+
+void ParserTest::testCommentedDesignMatchesClean() {
+    using MiniEDA::LogicState;
+
+    // Same circuit twice: once clean, once full of comments containing keywords and valid-looking statements
+    std::string clean =
+        "module half_adder_ext (input a, b, en, output sum, carry, flag);\n"
+        "  wire s0, c0;\n"
+        "  xor x1 (s0, a, b);\n"
+        "  and a1 (c0, a, b);\n"
+        "  assign sum = s0 & en;\n"
+        "  assign carry = c0 & en;\n"
+        "  nor n1 (flag, s0, c0);\n"
+        "endmodule";
+
+    std::string commented =
+        "// module fake (input q, output r); and g0 (r, q, q); endmodule\n"
+        "/* input ghost_in; output ghost_out;\n"
+        "   wire ghost_w; assign ghost_out = ghost_in | ghost_w;\n"
+        "   nand ghost_g (ghost_out, ghost_in, ghost_w); */\n"
+        "module half_adder_ext ( // ports: input x, output y\n"
+        "  input a, b, /* input c, */ en,\n"
+        "  // output never_declared,\n"
+        "  output sum, carry, /* and, or, xor */ flag\n"
+        ");\n"
+        "  wire s0, /* wire bogus; */ c0; // wire another_bogus;\n"
+        "  xor x1 (s0, a, /* c, */ b); // xor x2 (s0, a, a);\n"
+        "  and a1 (c0, a, b); /* not n9 (c0, a); */\n"
+        "  // assign sum = a | b;\n"
+        "  assign sum = s0 /* | a */ & en;\n"
+        "  assign carry = c0 & en; // ; ) ( stray delimiters\n"
+        "  /* // a line comment marker inside a block comment */\n"
+        "  // /* a block opener inside a line comment does not start a block\n"
+        "  nor n1 (flag, s0, c0);\n"
+        "/**/ endmodule /* trailing ***/";
+
+    MiniEDA::Parser cleanParser, commentedParser;
+    QVERIFY(cleanParser.parseNetlist(clean));
+    QVERIFY(commentedParser.parseNetlist(commented));
+
+    // Structure must be identical: no ports, wires or gates leaking out of comments
+    QCOMPARE(commentedParser.getInputs(), cleanParser.getInputs());
+    QCOMPARE(commentedParser.getOutputs(), cleanParser.getOutputs());
+    QCOMPARE(commentedParser.getGates().size(), cleanParser.getGates().size());
+    for (size_t g = 0; g < cleanParser.getGates().size(); ++g) {
+        const auto& expected = cleanParser.getGates().at(g);
+        const auto& actual = commentedParser.getGates().at(g);
+        // Generated assign gate names embed the source line, which differs between the two versions
+        if (expected.name.rfind("assign_L", 0) != 0) {
+            QCOMPARE(actual.name, expected.name);
+        }
+        QCOMPARE(actual.type, expected.type);
+        QCOMPARE(actual.outputWire, expected.outputWire);
+        QCOMPARE(actual.inputWires, expected.inputWires);
+    }
+
+    // Behaviour must be identical for every input combination
+    const char* ins[] = {"a", "b", "en"};
+    const char* outs[] = {"sum", "carry", "flag"};
+    for (int combo = 0; combo < 8; ++combo) {
+        for (int k = 0; k < 3; ++k) {
+            LogicState s = (combo >> k) & 1 ? LogicState::LogicHigh : LogicState::LogicLow;
+            cleanParser.setInputState(ins[k], s);
+            commentedParser.setInputState(ins[k], s);
+        }
+        cleanParser.evaluateCircuit();
+        commentedParser.evaluateCircuit();
+        for (const char* out : outs) {
+            QCOMPARE(commentedParser.getWireState(out), cleanParser.getWireState(out));
+        }
+    }
+
+    // Spot-check real values: a=1, b=1, en=1 -> sum 0, carry 1, flag 0
+    for (const char* in : ins) commentedParser.setInputState(in, LogicState::LogicHigh);
+    commentedParser.evaluateCircuit();
+    QCOMPARE(commentedParser.getWireState("sum"), LogicState::LogicLow);
+    QCOMPARE(commentedParser.getWireState("carry"), LogicState::LogicHigh);
+    QCOMPARE(commentedParser.getWireState("flag"), LogicState::LogicLow);
 }
 
 QTEST_MAIN(ParserTest)

@@ -5,6 +5,7 @@
 #include <QGraphicsView>
 #include <QGraphicsScene>
 #include <QGraphicsRectItem>
+#include <QGraphicsPathItem>
 #include <QGraphicsSceneMouseEvent>
 #include <QBrush>
 #include <QPen>
@@ -75,9 +76,7 @@ private:
     QTextEdit *editor;
     QGraphicsView *view;
     QGraphicsScene *scene;
-    MiniEDA::Parser m_parser; 
+    MiniEDA::Parser m_parser;
 
-    std::map<std::string, int> inputStates; 
-    
     void renderCircuit();
 };
