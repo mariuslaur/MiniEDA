@@ -85,6 +85,7 @@ QT_QPA_PLATFORM=xcb ./MiniEDA
 The validation harness evaluates key architectural invariants (ANSI parsing stability, token identification, trivalent bitwise logic propagation, and precise error coordinate tracking).
 
 Execute tests directly via the CMake abstraction layer from your `build` directory:
+
 Run all tests:
 ```bash
 ctest --output-on-failure
