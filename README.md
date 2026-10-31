@@ -36,7 +36,7 @@ The code is split into three layers, each built as its own CMake target:
 |---|---|---|---|
 | Core | `MiniEDACore` | C++ standard library only | `Lexer` (tokens with line/column, comment stripping), `Parser` (declarations, gates, vectors, `assign` lowering into a `Netlist`), `Simulator` (tri-state evaluation of a `Netlist`) |
 | Layout | `MiniEDALayout` | Core + Qt Core | `computeSchematicLayout`: placement of ports and gates and orthogonal channel routing, as pure geometry (`QPointF`/`QRectF`), no scene or widgets |
-| UI | `MiniEDA` | Layout + Qt Widgets | Graphics items, the schematic scene, the zoomable view and the main window |
+| UI | `MiniEDAUi` (+ `MiniEDA` app) | Layout + Qt Widgets | Graphics items, the schematic scene, the zoomable view and the main window; a library so the UI tests can link it |
 
 - The **`Netlist`** is plain data (module name, ports, wires, gates) shared by the simulator and the layout.
 - The **`Simulator`** owns the net states; the parser holds no simulation state.
@@ -103,13 +103,15 @@ MiniEDA/
 │   ├── circuitItems.hpp      # Input/output port and gate items, colour palette
 │   ├── schematicScene.hpp    # Builds and refreshes the drawn circuit
 │   ├── zoomableView.hpp      # Ctrl+wheel zoom, fit-to-window, pan
+│   ├── hoverSplitter.hpp     # Editor/schematic divider highlighted on mouse over
 │   └── mainWindow.hpp        # Editor + schematic window
 ├── src/                      # Implementations of the headers above, plus main.cpp
 ├── tests/
 │   ├── testUtils.hpp         # Shared helpers (load examples, parse)
 │   ├── parserTest.cpp        # Parsing, comments, vectors, assign, syntax errors
 │   ├── simulatorTest.cpp     # Truth tables, Z handling, mux, shift register
-│   └── layoutTest.cpp        # No overlapping wires, no wire through a gate, every pin wired
+│   ├── layoutTest.cpp        # No overlapping wires, no wire through a gate, every pin wired
+│   └── uiTest.cpp            # Real clicks on the schematic, black text, theme toggle
 └── verilog/                  # Example designs (gates, dataflow, decoder, mux, shift register, ...)
 ```
 
@@ -166,6 +168,10 @@ Each gate box also shows its input and output values, e.g. `In: [1, 0, 1]`, `Out
 | Fit circuit to window | `Fit` button | Ctrl + `0` |
 | Actual size | `100%` button | Ctrl + `1` |
 | Pan | Drag on empty canvas, or scroll | |
+| Dark / light theme | `Light Theme` / `Dark Theme` button (right of the zoom controls) | |
+| Resize editor / schematic | Drag the divider between the two panels (highlighted on mouse over) | |
+
+The application starts in the system theme. With Qt 6.8 or newer the theme switch uses Qt's native colour scheme; with older Qt it switches to the Fusion style with a dark or light palette. The schematic keeps its light boxes and black text in both themes for contrast.
 
 Large circuits are fitted to the window automatically when loaded, and stay fitted while the window is resized until you zoom manually.
 
@@ -181,11 +187,12 @@ Latches and flip-flops start in an unknown (`Z`) state, as in real hardware. Giv
 
 ## 🧪 Running the Unit Test Suite
 
-There is one test executable per component, and each test function is registered as its own CTest entry (`Parser.<testName>`, `Simulator.<testName>`, `Layout.<testName>`). The names are discovered automatically from the `void testX();` declarations, so new tests appear after a normal build. The suites cover:
+There is one test executable per component, and each test function is registered as its own CTest entry (`Parser.<testName>`, `Simulator.<testName>`, `Layout.<testName>`, `Ui.<testName>`). CTest runs them with `QT_QPA_PLATFORM=offscreen`, so no display is needed. The names are discovered automatically from the `void testX();` declarations, so new tests appear after a normal build. The suites cover:
 
 - **Parser**: port/wire/gate parsing, vectors, bit selects and `assign` expressions; comments containing keywords (including a commented design compared against its clean version); precise error coordinates and malformed input; every file in `verilog/` must parse, have a module name and contain gates.
 - **Simulator**: tri-state truth tables, controlling-value resolution, `assign` and vector evaluation, the 4-to-1 mux, and a full sequence on the universal shift register (reset, load, hold, shift-right, shift-left).
 - **Layout**: for every file in `verilog/`, with normal and oversized boxes, wires of different nets never overlap, no wire passes through a gate, every segment is horizontal or vertical and stays inside the module frame; every gate input and output port is wired.
+- **Ui**: loading draws every element with inputs at 0; real mouse clicks drive the shift register; schematic text stays black under a dark palette; the theme button toggles dark/light and sits right of the zoom controls.
 
 Testing techniques used:
 
@@ -205,7 +212,7 @@ ctest -R Parser.testAssignExpressions
 
 Show the detailed QtTest output of one suite:
 ```bash
-./parserTest      # or ./simulatorTest, ./layoutTest
+./parserTest      # or ./simulatorTest, ./layoutTest, ./uiTest (with QT_QPA_PLATFORM=offscreen if there is no display)
 ```
 
 ---

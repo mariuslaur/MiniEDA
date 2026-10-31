@@ -19,6 +19,8 @@ QPen wirePen(LogicState state);
 QPen gateBorder();
 QPen portBorder();
 QFont gateFont();
+// Schematic text sits on light boxes, so it stays black even when the system theme is dark
+QColor textColor();
 } // namespace Palette
 
 // "0", "1" or "Z"

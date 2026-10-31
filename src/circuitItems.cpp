@@ -17,6 +17,7 @@ QSizeF measure(const QString& text, const QFont& font) {
 // Creates a label as a child of `box`, left-aligned and vertically centered in it
 QGraphicsTextItem* addLabel(QGraphicsRectItem* box, const QString& text, const QFont& font = QFont()) {
     auto* label = new QGraphicsTextItem(text, box);
+    label->setDefaultTextColor(Palette::textColor());
     label->setFont(font);
     QRectF rect = box->rect();
     label->setPos(rect.left() + kLabelPad, rect.top() + (rect.height() - label->boundingRect().height()) / 2.0);
@@ -68,6 +69,7 @@ QPen wirePen(LogicState state) {
 QPen gateBorder() { return QPen(Qt::darkBlue, 2); }
 QPen portBorder() { return QPen(Qt::black, 2); }
 QFont gateFont() { return QFont("Courier New", 9); }
+QColor textColor() { return QColor(Qt::black); }
 
 } // namespace Palette
 

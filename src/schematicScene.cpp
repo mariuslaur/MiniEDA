@@ -44,6 +44,7 @@ void SchematicScene::build(const Simulator& simulator, const QSizeF& viewSize) {
     addRect(layout.moduleFrame, QPen(QColor(80, 80, 80), 2, Qt::DashLine), QBrush(QColor(253, 253, 253)));
     const std::string title = netlist.moduleName.empty() ? "(unnamed)" : netlist.moduleName;
     auto* titleItem = addText(QString::fromStdString("Module: " + title), QFont("Arial", 11, QFont::Bold));
+    titleItem->setDefaultTextColor(Palette::textColor());
     titleItem->setPos(layout.titlePos);
 
     // Wires first, so ports and gates are drawn on top of their pin ends

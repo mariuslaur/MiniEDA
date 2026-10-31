@@ -1,6 +1,4 @@
 build/
-verilog/
-screenshots/
 .cmake/
 CMakeLists.txt.user
 *.moc
